@@ -5,13 +5,17 @@ Provides YamlFile class for loaded YAML data operations and YamlUtil class
 for file I/O and utility functions.
 """
 
-import yaml
-import os
 import re
+import shutil
+import tempfile
+import urllib.error
 import urllib.request
-from urllib.parse import urlparse
+import yaml
 from pathlib import Path
-from typing import Dict, Any, Optional, Union, List
+from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlparse
+
+from .repo_cloner import RepoCloner
 
 
 class YamlFile:
@@ -133,7 +137,9 @@ class YamlFile:
 
 class YamlUtil:
     """Utility class for YAML file I/O and common operations."""
-    
+
+    _repo_cloner: RepoCloner = RepoCloner()
+
     @staticmethod
     def read_yaml(file_path: Union[str, Path]) -> Optional['YamlFile']:
         try:
@@ -148,7 +154,8 @@ class YamlUtil:
             raise FileNotFoundError(f"Configuration file '{file_path}' not found or invalid")
     
     @staticmethod
-    def read_yaml_from_url(url: str) -> Optional['YamlFile']:
+    def read_yaml_from_url_direct(url: str) -> Optional['YamlFile']:
+        """Fetch YAML content directly from an HTTP(S) endpoint."""
         try:
             with urllib.request.urlopen(url) as response:
                 content = response.read().decode('utf-8')
@@ -156,6 +163,74 @@ class YamlUtil:
                 return YamlFile(data, url)
         except (urllib.error.URLError, yaml.YAMLError, UnicodeDecodeError):
             return None
+
+    @classmethod
+    def read_yaml_from_url(
+        cls,
+        url: str,
+        allow_clone_fallback: bool = True,
+        target_filename: Optional[str] = None,
+        clone_root: Optional[Path] = None,
+    ) -> Optional['YamlFile']:
+        if not url:
+            return None
+
+        target_filename = target_filename or cls._default_target_filename(url)
+
+        if cls.is_url(url):
+            yaml_file = cls.read_yaml_from_url_direct(url)
+            if yaml_file or not allow_clone_fallback:
+                return yaml_file
+
+            if allow_clone_fallback:
+                clone_url = cls._derive_clone_url(url)
+                if not clone_url:
+                    return None
+                return cls.read_yaml_from_url_via_clone(clone_url, target_filename, clone_root)
+
+            return None
+
+        if not allow_clone_fallback:
+            return None
+
+        return cls.read_yaml_from_url_via_clone(url, target_filename, clone_root)
+
+    @classmethod
+    def read_yaml_from_url_via_clone(
+        cls,
+        repo_url: str,
+        target_filename: str,
+        clone_root: Optional[Path] = None,
+    ) -> Optional['YamlFile']:
+        if not repo_url or not target_filename:
+            return None
+
+        repo_folder = cls._sanitize_repo_folder_name(repo_url)
+
+        if clone_root:
+            clone_root.mkdir(parents=True, exist_ok=True)
+            target_dir = clone_root / repo_folder
+            cleanup_root = clone_root
+        else:
+            cleanup_root = Path(tempfile.mkdtemp(prefix="adhd_yaml_clone_"))
+            target_dir = cleanup_root / repo_folder
+
+        shutil.rmtree(target_dir, ignore_errors=True)
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
+
+        if not cls._repo_cloner.clone(target_dir, repo_url):
+            cls._cleanup_clone_paths(target_dir, cleanup_root)
+            return None
+
+        yaml_path = target_dir / Path(target_filename)
+        yaml_file: Optional[YamlFile]
+        try:
+            yaml_file = cls.read_yaml(yaml_path)
+        except FileNotFoundError:
+            yaml_file = None
+
+        cls._cleanup_clone_paths(target_dir, cleanup_root)
+        return yaml_file
     
     @staticmethod
     def is_url(item: str) -> bool:
@@ -204,6 +279,59 @@ class YamlUtil:
             clean_path = path.lstrip('/')
             return f"https://raw.githubusercontent.com/{repo_full_name}/{branch}/{clean_path}"
         return ""
+
+    @staticmethod
+    def _default_target_filename(url: str) -> str:
+        parsed = urlparse(url)
+        name = Path(parsed.path).name
+        if name and name.lower().endswith((".yaml", ".yml")):
+            return name
+        return "init.yaml"
+
+    @staticmethod
+    def _derive_clone_url(url: str) -> Optional[str]:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return None
+
+        if parsed.path.endswith('.git'):
+            return url
+
+        host = parsed.netloc.lower()
+        path_parts = [part for part in parsed.path.strip('/').split('/') if part]
+
+        if host.endswith("github.com") and len(path_parts) >= 2:
+            owner, repo = path_parts[0], path_parts[1]
+            if repo.endswith('.git'):
+                repo = repo[:-4]
+            return f"https://github.com/{owner}/{repo}.git"
+
+        if host.endswith("raw.githubusercontent.com") and len(path_parts) >= 2:
+            owner, repo = path_parts[0], path_parts[1]
+            if repo.endswith('.git'):
+                repo = repo[:-4]
+            return f"https://github.com/{owner}/{repo}.git"
+
+        return None
+
+    @staticmethod
+    def _sanitize_repo_folder_name(repo_url: str) -> str:
+        repo_name = YamlUtil.get_repo_name(repo_url)
+        if repo_name:
+            base = repo_name
+        else:
+            base = re.sub(r'[^A-Za-z0-9._-]+', '_', repo_url).strip('_') or 'repo'
+        return f"{base}_yaml"
+
+    @staticmethod
+    def _cleanup_clone_paths(target_dir: Path, root_dir: Optional[Path]) -> None:
+        shutil.rmtree(target_dir, ignore_errors=True)
+        if root_dir:
+            try:
+                if root_dir.exists() and not any(root_dir.iterdir()):
+                    root_dir.rmdir()
+            except OSError:
+                pass
 
     @staticmethod
     def load_init_yaml(file_path: str = "init.yaml", defaults_schema: Dict[str, Any] = None) -> Optional['YamlFile']:
