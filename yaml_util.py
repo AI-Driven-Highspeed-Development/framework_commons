@@ -178,17 +178,18 @@ class YamlUtil:
         target_filename = target_filename or cls._default_target_filename(url)
 
         if cls.is_url(url):
-            yaml_file = cls.read_yaml_from_url_direct(url)
-            if yaml_file or not allow_clone_fallback:
-                return yaml_file
+            for candidate in cls._candidate_direct_urls(url, target_filename):
+                yaml_file = cls.read_yaml_from_url_direct(candidate)
+                if yaml_file:
+                    return yaml_file
 
-            if allow_clone_fallback:
-                clone_url = cls._derive_clone_url(url)
-                if not clone_url:
-                    return None
-                return cls.read_yaml_from_url_via_clone(clone_url, target_filename, clone_root)
+            if not allow_clone_fallback:
+                return None
 
-            return None
+            clone_url = cls._derive_clone_url(url)
+            if not clone_url:
+                return None
+            return cls.read_yaml_from_url_via_clone(clone_url, target_filename, clone_root)
 
         if not allow_clone_fallback:
             return None
@@ -287,6 +288,32 @@ class YamlUtil:
         if name and name.lower().endswith((".yaml", ".yml")):
             return name
         return "init.yaml"
+
+    @staticmethod
+    def _candidate_direct_urls(url: str, target_filename: str) -> List[str]:
+        candidates: List[str] = []
+
+        normalized = url.strip()
+        if normalized:
+            candidates.append(normalized)
+
+        if target_filename:
+            stripped = normalized.rstrip('/')
+            if stripped and not stripped.endswith(f"/{target_filename}"):
+                appended = stripped + f"/{target_filename}"
+                candidates.append(appended)
+
+        raw_url = YamlUtil.construct_github_raw_url(url, target_filename)
+        if raw_url:
+            candidates.append(raw_url)
+
+        seen = set()
+        unique_candidates: List[str] = []
+        for candidate in candidates:
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                unique_candidates.append(candidate)
+        return unique_candidates
 
     @staticmethod
     def _derive_clone_url(url: str) -> Optional[str]:
