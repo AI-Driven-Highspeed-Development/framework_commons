@@ -86,6 +86,17 @@ class RepoCloner:
 		return repo_url
 
 	@staticmethod
+	def is_ssh_url(repo_url: str) -> bool:
+		return repo_url.startswith(("git@", "ssh://"))
+
+	@staticmethod
+	def remove_git_suffix(repo_url: str) -> str:
+		repo_url = repo_url.lower()
+		if repo_url.endswith(".git"):
+			return repo_url[:-4]
+		return repo_url
+
+	@staticmethod
 	def build_git_env(use_ssh: bool, ssh_key: Optional[str]) -> Optional[Dict[str, str]]:
 		if ssh_key:
 			env = os.environ.copy()
