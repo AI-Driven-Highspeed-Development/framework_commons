@@ -154,56 +154,49 @@ class YamlUtil:
             raise FileNotFoundError(f"Configuration file '{file_path}' not found or invalid")
     
     @staticmethod
-    def read_yaml_from_url_direct(url: str) -> Optional['YamlFile']:
-        """Fetch YAML content directly from an HTTP(S) endpoint."""
-        try:
-            with urllib.request.urlopen(url) as response:
-                content = response.read().decode('utf-8')
-                data = yaml.safe_load(content) or {}
-                return YamlFile(data, url)
-        except (urllib.error.URLError, yaml.YAMLError, UnicodeDecodeError):
+    def read_yaml_from_url_direct(repo_url: str, file_path: str, branch: str = "main") -> Optional['YamlFile']:
+        """Fetch YAML content directly from a repository via raw HTTP access."""
+        if not repo_url:
             return None
+
+        if not file_path:
+            return YamlUtil._fetch_yaml_from_http(repo_url)
+
+        raw_url = YamlUtil.construct_github_raw_url(repo_url, file_path, branch)
+        if not raw_url:
+            raw_url = YamlUtil._build_generic_file_url(repo_url, file_path)
+
+        return YamlUtil._fetch_yaml_from_http(raw_url)
 
     @classmethod
     def read_yaml_from_url(
         cls,
-        url: str,
+        repo_url: str,
+        file_path: str,
+        branch: str = "main",
         allow_clone_fallback: bool = True,
-        target_filename: Optional[str] = None,
         clone_root: Optional[Path] = None,
     ) -> Optional['YamlFile']:
-        if not url:
+        if not repo_url or not file_path:
             return None
 
-        target_filename = target_filename or cls._default_target_filename(url)
+        if cls._is_ssh_url(repo_url):
+            return cls.read_yaml_from_url_via_clone(repo_url, file_path, clone_root)
 
-        if cls.is_url(url):
-            for candidate in cls._candidate_direct_urls(url, target_filename):
-                yaml_file = cls.read_yaml_from_url_direct(candidate)
-                if yaml_file:
-                    return yaml_file
+        yaml_file = cls.read_yaml_from_url_direct(repo_url, file_path, branch)
+        if yaml_file or not allow_clone_fallback:
+            return yaml_file
 
-            if not allow_clone_fallback:
-                return None
-
-            clone_url = cls._derive_clone_url(url)
-            if not clone_url:
-                return None
-            return cls.read_yaml_from_url_via_clone(clone_url, target_filename, clone_root)
-
-        if not allow_clone_fallback:
-            return None
-
-        return cls.read_yaml_from_url_via_clone(url, target_filename, clone_root)
+        return cls.read_yaml_from_url_via_clone(repo_url, file_path, clone_root)
 
     @classmethod
     def read_yaml_from_url_via_clone(
         cls,
         repo_url: str,
-        target_filename: str,
+        file_path: str,
         clone_root: Optional[Path] = None,
     ) -> Optional['YamlFile']:
-        if not repo_url or not target_filename:
+        if not repo_url or not file_path:
             return None
 
         repo_folder = cls._sanitize_repo_folder_name(repo_url)
@@ -223,7 +216,8 @@ class YamlUtil:
             cls._cleanup_clone_paths(target_dir, cleanup_root)
             return None
 
-        yaml_path = target_dir / Path(target_filename)
+        relative_path = Path(file_path.lstrip('/'))
+        yaml_path = target_dir / relative_path
         yaml_file: Optional[YamlFile]
         try:
             yaml_file = cls.read_yaml(yaml_path)
@@ -282,66 +276,6 @@ class YamlUtil:
         return ""
 
     @staticmethod
-    def _default_target_filename(url: str) -> str:
-        parsed = urlparse(url)
-        name = Path(parsed.path).name
-        if name and name.lower().endswith((".yaml", ".yml")):
-            return name
-        return "init.yaml"
-
-    @staticmethod
-    def _candidate_direct_urls(url: str, target_filename: str) -> List[str]:
-        candidates: List[str] = []
-
-        normalized = url.strip()
-        if normalized:
-            candidates.append(normalized)
-
-        if target_filename:
-            stripped = normalized.rstrip('/')
-            if stripped and not stripped.endswith(f"/{target_filename}"):
-                appended = stripped + f"/{target_filename}"
-                candidates.append(appended)
-
-        raw_url = YamlUtil.construct_github_raw_url(url, target_filename)
-        if raw_url:
-            candidates.append(raw_url)
-
-        seen = set()
-        unique_candidates: List[str] = []
-        for candidate in candidates:
-            if candidate and candidate not in seen:
-                seen.add(candidate)
-                unique_candidates.append(candidate)
-        return unique_candidates
-
-    @staticmethod
-    def _derive_clone_url(url: str) -> Optional[str]:
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            return None
-
-        if parsed.path.endswith('.git'):
-            return url
-
-        host = parsed.netloc.lower()
-        path_parts = [part for part in parsed.path.strip('/').split('/') if part]
-
-        if host.endswith("github.com") and len(path_parts) >= 2:
-            owner, repo = path_parts[0], path_parts[1]
-            if repo.endswith('.git'):
-                repo = repo[:-4]
-            return f"https://github.com/{owner}/{repo}.git"
-
-        if host.endswith("raw.githubusercontent.com") and len(path_parts) >= 2:
-            owner, repo = path_parts[0], path_parts[1]
-            if repo.endswith('.git'):
-                repo = repo[:-4]
-            return f"https://github.com/{owner}/{repo}.git"
-
-        return None
-
-    @staticmethod
     def _sanitize_repo_folder_name(repo_url: str) -> str:
         repo_name = YamlUtil.get_repo_name(repo_url)
         if repo_name:
@@ -349,6 +283,30 @@ class YamlUtil:
         else:
             base = re.sub(r'[^A-Za-z0-9._-]+', '_', repo_url).strip('_') or 'repo'
         return f"{base}_yaml"
+
+    @staticmethod
+    def _build_generic_file_url(repo_url: str, file_path: str) -> str:
+        trimmed_repo = repo_url.rstrip('/')
+        if trimmed_repo.endswith('.git'):
+            trimmed_repo = trimmed_repo[:-4]
+        clean_path = file_path.lstrip('/')
+        return f"{trimmed_repo}/{clean_path}"
+
+    @staticmethod
+    def _is_ssh_url(repo_url: str) -> bool:
+        return repo_url.startswith(("git@", "ssh://"))
+
+    @staticmethod
+    def _fetch_yaml_from_http(url: str) -> Optional['YamlFile']:
+        if not url:
+            return None
+        try:
+            with urllib.request.urlopen(url) as response:
+                content = response.read().decode('utf-8')
+                data = yaml.safe_load(content) or {}
+                return YamlFile(data, url)
+        except (urllib.error.URLError, yaml.YAMLError, UnicodeDecodeError):
+            return None
 
     @staticmethod
     def _cleanup_clone_paths(target_dir: Path, root_dir: Optional[Path]) -> None:
